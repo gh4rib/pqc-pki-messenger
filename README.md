@@ -1,10 +1,12 @@
-# pqc-pki-messenger
+# PKI and PQC-Messenger
 A hobby project to implemennt PQS-CA/Cert generation and PQS Messenger using openssl 3.5+ and liboqs on Debian/13.5.
 
 Information you need if you are not familiar with post-quantum world
 - ML-DSA (Dilithium) is strictly a digital signature algorithm. It can only be used to sign and verify messages to guarantee authenticity and integrity. It cannot be used to encrypt or decrypt data. For post-quantum asymmetric encryption/decryption, you must use ML-KEM (Kyber).
 - As of mid-2026, the CA/Browser Forum has not authorized public Certificate Authorities (like Let's Encrypt or ZeroSSL) to issue ML-DSA certificates, and root stores (like Windows, Apple, or Mozilla) do not trust them yet. The first publicly trusted PQ certificates aren't expected to be broadly recognized until 2027.
-
+- What is Stateful Signature Scheme? [link](https://github.com/gh4rib/pqc-pki-messenger/blob/main/stateful-signature-scheme.md)
+- What is Extendable-Output Functions ? [link](https://github.com/gh4rib/pqc-pki-messenger/blob/main/xof.md)
+- What is Ascon v1.2 ? [link](https://github.com/gh4rib/pki-pqc-messenger/blob/main/ascon-vs-aes.md)
 ---
 
 ## Requirements
@@ -77,12 +79,16 @@ activate = 1
 
 ---
 
-
-
-
 ## PQ-PKI
 The post-quantum safe PKI written with bash (wrapper for OpenSSL & liboqs) using algorithms they provide along with a test engine that run a PQ Server and Client using openssl to initiate and test
 the result of the script.
 <strong> It is just an implementation of the whole process which is not tested thoroughly by me. I just tested one combination of the algorithms and tested them </strong>.
 
+### Procedure
+Modern X.509 Architecture Note
+
+- Root CA Key: Must use an asymmetric Signature scheme (like ML-DSA, Falcon, or SLH-DSA) to allow it to sign certificates.
+- Website/Server Key: Can either be an asymmetric Signature scheme (for classic authentication) or a KEM scheme (for key exchange optimization).
+- Symmetric Protection: When saving private keys, the script allows you to encrypt them using ChaCha20, AES-256-CBC, or Camellia-256-CBC.
+- MACs (HMAC, SipHash, Poly1305, CMAC): These are symmetric Message Authentication Codes and do not utilize asymmetric public/private keys; therefore, they cannot be embedded into X.509 certificates. They are omitted from the certificate menu but noted for symmetric data integrity.
 
