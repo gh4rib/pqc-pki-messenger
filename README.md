@@ -1,5 +1,5 @@
 # PKI and PQC-Messenger
-A hobby project to implemennt PQS-CA/Cert generation and PQS Messenger using openssl 3.5+ and liboqs on Debian/13.5.
+A hobby project to implemennt PQS-CA/Cert generation and PQS Messenger(It is not an actual messenger like Signal 🙂 ) using openssl 3.5+ and liboqs on Debian/13.5.
 
 Information you need if you are not familiar with post-quantum world
 - ML-DSA (Dilithium) is strictly a digital signature algorithm. It can only be used to sign and verify messages to guarantee authenticity and integrity. It cannot be used to encrypt or decrypt data. For post-quantum asymmetric encryption/decryption, you must use ML-KEM (Kyber).
