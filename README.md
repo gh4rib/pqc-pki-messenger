@@ -571,3 +571,60 @@ This phase strictly reverses the encryption steps. **Crucially, it verifies auth
 - Because both the Signature and the HMAC Tag are mathematically proven valid, Bob finally decrypts `payload.cipher` using the `HEX_KEY` and `HEX_IV`.
 - The plaintext `decrypted_message.txt` is written to disk.
 
+### Considerations
+**You must send the entire contents of the `outbox_msg_...` folder to the recipient**
+
+Think of that folder as a **cryptographic package**. If you omit even one file, the recipient’s decryption script will fail, because each file provides a "piece of the puzzle" that is mathematically required to perform the decryption and signature verification.
+
+If the recipient is missing any part, the math breaks. Here is why every single file in that folder is a hard dependency:
+
+#### The "Cryptographic Bundle" Dependency Map
+
+| File Name | Mathematical Role | What happens if missing? |
+| --- | --- | --- |
+| `payload.encap` | Contains the wrapped KEM secret. | Recipient cannot derive the "Master Key." |
+| `payload.cipher` | The encrypted message body. | Obviously, the message is gone. |
+| `payload.iv` | Initialization Vector. | Decryption will produce gibberish (AES/ChaCha initialization fails). |
+| `payload.tag` | HMAC/AEAD Tag. | The script will trigger a **Critical Error** and refuse to decrypt because it cannot verify integrity. |
+| `payload.sig` | The Digital Signature. | The script will trigger a **Critical Error** and refuse to process the message. |
+| `sender_x25519.pub` | The Hybrid Safety Net. | Recipient cannot derive the classical half of your hybrid key. |
+
+
+#### Best Practices for Sending
+
+Since you are building a professional-grade protocol, follow these three best practices for sending your `outbox` folder:
+
+##### 1. Compress it for Integrity
+
+Instead of sending a folder (which can sometimes lose permissions or metadata in transit), compress it into a single archive before sending.
+
+```bash
+# On your machine:
+tar -czvf message_to_bob.tar.gz ./outbox_msg_YYYYMMDD_HHMMSS/
+
+```
+
+When Bob receives it, he simply extracts it:
+
+```bash
+tar -xzvf message_to_bob.tar.gz
+
+```
+
+##### 2. **Beware of Metadata**
+
+Even though your message is encrypted, remember that the **filenames, file sizes, and timestamps** in that folder are not hidden.
+
+* If Bob is using a public email service (like Gmail), Google can see that `payload.cipher` is 5KB. They know exactly how much data you are sending.
+* If you are sending highly sensitive data, consider putting the `outbox` folder inside a larger, dummy archive or sending it via an already-encrypted channel (like a Signal message or an Onion service) to hide the fact that a file was sent at all.
+
+##### 3. The "Verification Handshake"
+
+Because this is manual, make it a habit to check the **fingerprints** one last time before Bob decrypts.
+
+* Ask Bob: *"I just sent you the message. The signature fingerprint for the `sig.pub` I used to sign it is `XX:XX:XX...`"*
+* If Bob confirms the fingerprint on his end matches, he can be 100% certain that the file wasn't replaced by a man-in-the-middle during the transfer.
+
+#### Beyond this Simple/Hobby project
+I plan to implement an application using ``cloudflare/circl`` and ``cloudflare/go`` later.
+You can also use ``gnupg 2.5+`` and use kyber to generate your key
