@@ -1,6 +1,6 @@
-# PKI and PQC-Messenger
+# Post-Quantum PKI & Post-Quantum Privacy Guard with OpenSSL/liboqs
 
-A hobby project to implement PQS-CA/Cert generation and PQS Messenger (It is not an actual messenger like Signal 🙂) using OpenSSL 3.5+ and liboqs on Debian 13.5.
+A hobby project to implement PQS-CA/Cert generation and PQS Privacy Guard using OpenSSL 3.5+ and liboqs on Debian 13.5.
 
 ### Information you need if you are not familiar with the post-quantum world:
 
