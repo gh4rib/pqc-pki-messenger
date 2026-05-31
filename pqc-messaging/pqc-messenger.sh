@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# POST-QUANTUM MODULE 2: SECURE MESSAGING & IDENTITY ENGINE (v8.0)
+# POST-QUANTUM MODULE 2: SECURE MESSAGING & IDENTITY ENGINE (v8.5)
 # Architecture: Hybrid KEM (X25519 + ML-KEM) + Encrypt-then-MAC + SPHINCS+ Identity
-# Patch Notes: Added Fingerprinting, SLH-DSA, and Hybrid safety-net KEX.
+# Enhancements: OpenPGP Packet Serialization, Literal Enclaves, Traffic Padding
 # ==============================================================================
 set -e
 set -o pipefail
@@ -11,7 +11,6 @@ set -o pipefail
 PROVIDER_ARGS=("-provider" "default" "-provider" "oqsprovider")
 
 # --- EXHAUSTIVE ALGORITHM LISTS ---
-# KEMs used for Ephemeral Session Keys
 LIST_KEMS=(
     "MLKEM512" "MLKEM768" "MLKEM1024"
     "p256_mlkem512" "p384_mlkem768" "p521_mlkem1024" 
@@ -20,7 +19,6 @@ LIST_KEMS=(
     "frodo1344aes" "p521_frodo1344aes" "frodo1344shake" "p521_frodo1344shake"
 )
 
-# Identity Signatures (Added SPHINCS+ / SLH-DSA for ultra-conservative security)
 LIST_SIGS=(
     "MLDSA87" "MLDSA65" "MLDSA44" 
     "SLH-DSA-SHA2-128s" "SLH-DSA-SHA2-128f" "SLH-DSA-SHA2-256s" "SLH-DSA-SHA2-256f"
@@ -57,6 +55,12 @@ select_variant() {
     done
 }
 
+extract_block() {
+    local file=$1
+    local marker=$2
+    sed -n "/---${marker}---/,/^---/p" "$file" | grep -v "^---" | base64 -d
+}
+
 if ! command -v xxd &> /dev/null; then
     echo "[-] CRITICAL: 'xxd' is not installed. Please run: sudo apt install xxd"
     exit 1
@@ -64,20 +68,17 @@ fi
 
 clear
 echo "====================================================================="
-echo "        POST-QUANTUM E2EE MESSAGING ENGINE (v8.0)"
+echo "        POST-QUANTUM E2EE MESSAGING ENGINE (v8.5)"
 echo "====================================================================="
 echo "1) Generate New Identity Keyring (Keys to keep & share)"
 echo "2) Generate Cryptographic Fingerprints (For GitHub/Bio)"
-echo "3) Encrypt & Sign a Message (Send via Hybrid KEX)"
-echo "4) Decrypt & Verify a Message (Receive)"
+echo "3) Encrypt & Sign a Message (Produces Serialized Armor Package)"
+echo "4) Decrypt & Verify a Message (Parses Serialized Armor Package)"
 echo "====================================================================="
 read -p "Select Action [1-4]: " action_choice
 
 case "$action_choice" in
     1)
-        # -----------------------------------------------------------------
-        # IDENTITY GENERATION
-        # -----------------------------------------------------------------
         echo -e "\n--- GENERATE NEW IDENTITY ---"
         read -p "Enter a username for this identity (e.g., alice): " username
         SAFE_USER=$(echo "$username" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
@@ -105,9 +106,6 @@ case "$action_choice" in
         ;;
 
     2)
-        # -----------------------------------------------------------------
-        # FINGERPRINT GENERATION
-        # -----------------------------------------------------------------
         echo -e "\n--- GENERATE CRYPTOGRAPHIC FINGERPRINTS ---"
         read -e -p "Path to your Public Keyring folder (e.g., ./identity_alice/public): " PUB_DIR
         
@@ -131,9 +129,6 @@ case "$action_choice" in
         ;;
         
     3)
-        # -----------------------------------------------------------------
-        # ENCRYPT AND SIGN (HYBRID KEX)
-        # -----------------------------------------------------------------
         echo -e "\n--- ENCRYPT & SIGN MESSAGE ---"
         read -e -p "Path to YOUR Private Keyring folder (e.g., ./identity_alice/private): " MY_PRIV_DIR
         read -e -p "Path to RECIPIENT'S Public Keyring folder (e.g., ./identity_bob/public): " REC_PUB_DIR
@@ -148,116 +143,155 @@ case "$action_choice" in
         HASH_ALG=$(select_variant LIST_DIGESTS)
         
         TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-        OUT_DIR="./outbox_msg_${TIMESTAMP}"
-        mkdir -p "$OUT_DIR"
+        TEMP_WORK=$(mktemp -d)
         
-        echo "[*] 1/7 Encapsulating Classical X25519 Secret..."
-        openssl pkeyutl "${PROVIDER_ARGS[@]}" -derive -inkey "${MY_PRIV_DIR}/x25519.priv" -peerkey "${REC_PUB_DIR}/x25519.pub" -out "${OUT_DIR}/classic_secret.bin"
+        echo "[*] 1/8 Constructing Sealed Literal Data Enclave & Applying Traffic Padding..."
+        ORIG_NAME=$(basename "$MSG_FILE")
+        ORIG_SIZE=$(stat -c%s "$MSG_FILE")
         
-        echo "[*] 2/7 Encapsulating Post-Quantum KEM Secret..."
-        openssl pkeyutl "${PROVIDER_ARGS[@]}" -encap -pubin -inkey "${REC_PUB_DIR}/pq_kem.pub" -out "${OUT_DIR}/pq_payload.encap" -secret "${OUT_DIR}/pq_secret.bin"
+        # Enveloping Metadata
+        echo "$ORIG_NAME" > "${TEMP_WORK}/enclave.raw"
+        echo "$ORIG_SIZE" >> "${TEMP_WORK}/enclave.raw"
+        cat "$MSG_FILE" >> "${TEMP_WORK}/enclave.raw"
         
-        echo "[*] 3/7 Deriving Hybrid Cipher Key and MAC Key..."
-        # We concatenate both the classical and PQ secrets, then hash them together to create a true Hybrid Key
-        cat "${OUT_DIR}/classic_secret.bin" "${OUT_DIR}/pq_secret.bin" | openssl dgst -sha512 -binary > "${OUT_DIR}/master_secret.bin"
-        HEX_KEY=$(xxd -p -c 64 "${OUT_DIR}/master_secret.bin" | cut -c 1-64) # First 32 bytes for AES
-        MAC_KEY=$(xxd -p -c 64 "${OUT_DIR}/master_secret.bin" | cut -c 65-128) # Second 32 bytes for HMAC
+        # Uniform block size enforcement (Align to 4096-byte boundaries to defeat file-size fingerprinting)
+        CUR_SIZE=$(stat -c%s "${TEMP_WORK}/enclave.raw")
+        PAD_LEN=$(( (4096 - (CUR_SIZE % 4096)) % 4096 ))
+        if [ $PAD_LEN -gt 0 ]; then
+            dd if=/dev/zero bs=1 count=$PAD_LEN >> "${TEMP_WORK}/enclave.raw" 2>/dev/null
+        fi
+
+        echo "[*] 2/8 Encapsulating Classical X25519 Secret..."
+        openssl pkeyutl "${PROVIDER_ARGS[@]}" -derive -inkey "${MY_PRIV_DIR}/x25519.priv" -peerkey "${REC_PUB_DIR}/x25519.pub" -out "${TEMP_WORK}/classic_secret.bin"
+        
+        echo "[*] 3/8 Encapsulating Post-Quantum KEM Secret..."
+        openssl pkeyutl "${PROVIDER_ARGS[@]}" -encap -pubin -inkey "${REC_PUB_DIR}/pq_kem.pub" -out "${TEMP_WORK}/pq_payload.encap" -secret "${TEMP_WORK}/pq_secret.bin"
+        
+        echo "[*] 4/8 Deriving Hybrid Cryptographic Master Keys via SHA-512 KDF..."
+        cat "${TEMP_WORK}/classic_secret.bin" "${TEMP_WORK}/pq_secret.bin" | openssl dgst -sha512 -binary > "${TEMP_WORK}/master_secret.bin"
+        HEX_KEY=$(xxd -p -c 64 "${TEMP_WORK}/master_secret.bin" | cut -c 1-64)
+        MAC_KEY=$(xxd -p -c 64 "${TEMP_WORK}/master_secret.bin" | cut -c 65-128)
         
         HEX_IV=$(openssl rand -hex 16)
-        echo "$HEX_IV" > "${OUT_DIR}/payload.iv"
         
-        # We MUST send our public X25519 key so the recipient can derive the classical half of the secret
-        cp "${MY_PRIV_DIR}/../public/x25519.pub" "${OUT_DIR}/sender_x25519.pub"
+        echo "[*] 5/8 Executing Encrypt-then-MAC (AEAD) Payload Protection..."
+        openssl enc -"${CIPHER}" -K "$HEX_KEY" -iv "$HEX_IV" -in "${TEMP_WORK}/enclave.raw" -out "${TEMP_WORK}/payload.cipher"
+        openssl dgst -sha256 -mac HMAC -macopt hexkey:"$MAC_KEY" -binary -out "${TEMP_WORK}/payload.tag" "${TEMP_WORK}/payload.cipher"
         
-        echo "[*] 4/7 Encrypting payload with ${CIPHER}..."
-        openssl enc -"${CIPHER}" -K "$HEX_KEY" -iv "$HEX_IV" -in "$MSG_FILE" -out "${OUT_DIR}/payload.cipher"
-        
-        echo "[*] 5/7 Generating AEAD Authentication Tag (HMAC)..."
-        openssl dgst -sha256 -mac HMAC -macopt hexkey:"$MAC_KEY" -binary -out "${OUT_DIR}/payload.tag" "${OUT_DIR}/payload.cipher"
-        
-        echo "[*] 6/7 Hashing and Signing cryptographic bundle with PQ Identity..."
-        # We must sign the sender's ephemeral classical key too, to prevent Man-in-the-Middle attacks on the hybrid mix
-        cat "${OUT_DIR}/payload.cipher" "${OUT_DIR}/payload.iv" "${OUT_DIR}/payload.tag" "${OUT_DIR}/sender_x25519.pub" > "${OUT_DIR}/temp.bundle"
+        echo "[*] 6/8 Signing Integrity Bundle with Post-Quantum Identity..."
+        cp "${MY_PRIV_DIR}/../public/x25519.pub" "${TEMP_WORK}/sender_x25519.pub"
+        cat "${TEMP_WORK}/payload.cipher" <(echo "$HEX_IV") "${TEMP_WORK}/payload.tag" "${TEMP_WORK}/sender_x25519.pub" > "${TEMP_WORK}/temp.bundle"
         
         if [[ "$HASH_ALG" == *"SHAKE"* ]]; then
-            openssl dgst "${PROVIDER_ARGS[@]}" -"$HASH_ALG" -xoflen 64 -binary -out "${OUT_DIR}/payload.hash" "${OUT_DIR}/temp.bundle"
+            openssl dgst "${PROVIDER_ARGS[@]}" -"$HASH_ALG" -xoflen 64 -binary -out "${TEMP_WORK}/payload.hash" "${TEMP_WORK}/temp.bundle"
         else
-            openssl dgst "${PROVIDER_ARGS[@]}" -"$HASH_ALG" -binary -out "${OUT_DIR}/payload.hash" "${OUT_DIR}/temp.bundle"
+            openssl dgst "${PROVIDER_ARGS[@]}" -"$HASH_ALG" -binary -out "${TEMP_WORK}/payload.hash" "${TEMP_WORK}/temp.bundle"
         fi
+        openssl pkeyutl "${PROVIDER_ARGS[@]}" -sign -rawin -in "${TEMP_WORK}/payload.hash" -inkey "${MY_PRIV_DIR}/sig.priv" -out "${TEMP_WORK}/payload.sig"
         
-        openssl pkeyutl "${PROVIDER_ARGS[@]}" -sign -rawin -in "${OUT_DIR}/payload.hash" -inkey "${MY_PRIV_DIR}/sig.priv" -out "${OUT_DIR}/payload.sig"
+        echo "[*] 7/8 Serializing Multi-Packet Cryptographic Stream into ASCII Armor..."
+        OUT_FILE="./msg_${TIMESTAMP}.pqp"
+        {
+            echo "-----BEGIN PQC PACKET STREAM-----"
+            echo "Version: PQC-8.5"
+            echo "Cipher: ${CIPHER}"
+            echo "Digest: ${HASH_ALG}"
+            echo "IV: ${HEX_IV}"
+            echo "---ENCAP---"
+            base64 -w 0 "${TEMP_WORK}/pq_payload.encap"; echo ""
+            echo "---SENDER-PUB---"
+            base64 -w 0 "${TEMP_WORK}/sender_x25519.pub"; echo ""
+            echo "---TAG---"
+            base64 -w 0 "${TEMP_WORK}/payload.tag"; echo ""
+            echo "---SIG---"
+            base64 -w 0 "${TEMP_WORK}/payload.sig"; echo ""
+            echo "---CIPHERTEXT---"
+            base64 -w 0 "${TEMP_WORK}/payload.cipher"; echo ""
+            echo "-----END PQC PACKET STREAM-----"
+        } > "$OUT_FILE"
         
-        echo "[*] 7/7 Scrubbing memory..."
-        rm -f "${OUT_DIR}/classic_secret.bin" "${OUT_DIR}/pq_secret.bin" "${OUT_DIR}/master_secret.bin" "${OUT_DIR}/temp.bundle" "${OUT_DIR}/payload.hash"
+        echo "[*] 8/8 Sanitizing Ephemeral Core Memory..."
+        rm -rf "$TEMP_WORK"
         
-        echo -e "\n\e[32m[+] Message Encrypted and Signed Successfully!\e[0m"
-        echo "Send the entire folder to the recipient: $OUT_DIR"
+        echo -e "\n\e[32m[+] Packet Stream Encrypted & Serialized Successfully!\e[0m"
+        echo "Exclusively share this single armored file with the recipient: $OUT_FILE"
         ;;
         
     4)
-        # -----------------------------------------------------------------
-        # DECRYPT AND VERIFY (HYBRID KEX)
-        # -----------------------------------------------------------------
         echo -e "\n--- DECRYPT & VERIFY MESSAGE ---"
         read -e -p "Path to YOUR Private Keyring folder (e.g., ./identity_bob/private): " MY_PRIV_DIR
         read -e -p "Path to SENDER'S Public Keyring folder (e.g., ./identity_alice/public): " SENDER_PUB_DIR
-        read -e -p "Path to the received message folder (e.g., ./outbox_msg_2026...): " MSG_DIR
+        read -e -p "Path to the received ASCII Armor package (.pqp file): " PACKET_FILE
         
-        if [ ! -d "$MSG_DIR" ]; then echo "[-] Message folder not found."; exit 1; fi
+        if [ ! -f "$PACKET_FILE" ]; then echo "[-] Package file not found."; exit 1; fi
         
-        echo -e "\nSelect Symmetric Payload Cipher used by sender:"
-        CIPHER=$(select_variant LIST_CIPHERS)
+        TEMP_WORK=$(mktemp -d)
         
-        echo -e "\nSelect Digest Hash used by sender:"
-        HASH_ALG=$(select_variant LIST_DIGESTS)
+        echo "[*] 1/6 Parsing Serialized Protocol Metadata & Stream Demultiplexing..."
+        CIPHER=$(grep "^Cipher:" "$PACKET_FILE" | awk '{print $2}')
+        HASH_ALG=$(grep "^Digest:" "$PACKET_FILE" | awk '{print $2}')
+        HEX_IV=$(grep "^IV:" "$PACKET_FILE" | awk '{print $2}')
+        
+        extract_block "$PACKET_FILE" "ENCAP" > "${TEMP_WORK}/pq_payload.encap"
+        extract_block "$PACKET_FILE" "SENDER-PUB" > "${TEMP_WORK}/sender_x25519.pub"
+        extract_block "$PACKET_FILE" "TAG" > "${TEMP_WORK}/payload.tag"
+        extract_block "$PACKET_FILE" "SIG" > "${TEMP_WORK}/payload.sig"
+        extract_block "$PACKET_FILE" "CIPHERTEXT" > "${TEMP_WORK}/payload.cipher"
 
-        echo "[*] 1/6 Verifying Post-Quantum Cryptographic Identity Signature..."
-        cat "${MSG_DIR}/payload.cipher" "${MSG_DIR}/payload.iv" "${MSG_DIR}/payload.tag" "${MSG_DIR}/sender_x25519.pub" > "${MSG_DIR}/temp.bundle"
+        echo "[*] 2/6 Verifying Post-Quantum Cryptographic Identity Signature..."
+        cat "${TEMP_WORK}/payload.cipher" <(echo "$HEX_IV") "${TEMP_WORK}/payload.tag" "${TEMP_WORK}/sender_x25519.pub" > "${TEMP_WORK}/temp.bundle"
         
         if [[ "$HASH_ALG" == *"SHAKE"* ]]; then
-            openssl dgst "${PROVIDER_ARGS[@]}" -"$HASH_ALG" -xoflen 64 -binary -out "${MSG_DIR}/payload.hash" "${MSG_DIR}/temp.bundle"
+            openssl dgst "${PROVIDER_ARGS[@]}" -"$HASH_ALG" -xoflen 64 -binary -out "${TEMP_WORK}/payload.hash" "${TEMP_WORK}/temp.bundle"
         else
-            openssl dgst "${PROVIDER_ARGS[@]}" -"$HASH_ALG" -binary -out "${MSG_DIR}/payload.hash" "${MSG_DIR}/temp.bundle"
+            openssl dgst "${PROVIDER_ARGS[@]}" -"$HASH_ALG" -binary -out "${TEMP_WORK}/payload.hash" "${TEMP_WORK}/temp.bundle"
         fi
         
-        if openssl pkeyutl "${PROVIDER_ARGS[@]}" -verify -rawin -in "${MSG_DIR}/payload.hash" -sigfile "${MSG_DIR}/payload.sig" -pubin -inkey "${SENDER_PUB_DIR}/sig.pub"; then
-            echo -e "\e[32m    -> IDENTITY VALID: Sender confirmed.\e[0m"
+        if openssl pkeyutl "${PROVIDER_ARGS[@]}" -verify -rawin -in "${TEMP_WORK}/payload.hash" -sigfile "${TEMP_WORK}/payload.sig" -pubin -inkey "${SENDER_PUB_DIR}/sig.pub"; then
+            echo -e "\e[32m    -> IDENTITY VALID: Genuine sender confirmed.\e[0m"
         else
-            echo -e "\e[31m[-] CRITICAL: Signature Verification Failed! Message was tampered with or sender is spoofed.\e[0m"
-            rm -f "${MSG_DIR}/temp.bundle" "${MSG_DIR}/payload.hash"
+            echo -e "\e[31m[-] CRITICAL: Signature Verification Failed! Package intercepted or spoofed.\e[0m"
+            rm -rf "$TEMP_WORK"
             exit 1
         fi
         
-        echo "[*] 2/6 Decapsulating Classical X25519 Secret..."
-        openssl pkeyutl "${PROVIDER_ARGS[@]}" -derive -inkey "${MY_PRIV_DIR}/x25519.priv" -peerkey "${MSG_DIR}/sender_x25519.pub" -out "${MSG_DIR}/classic_secret.bin"
+        echo "[*] 3/6 Executing Hybrid Decapsulation (Classical X25519 + ML-KEM)..."
+        openssl pkeyutl "${PROVIDER_ARGS[@]}" -derive -inkey "${MY_PRIV_DIR}/x25519.priv" -peerkey "${TEMP_WORK}/sender_x25519.pub" -out "${TEMP_WORK}/classic_secret.bin"
+        openssl pkeyutl "${PROVIDER_ARGS[@]}" -decap -inkey "${MY_PRIV_DIR}/pq_kem.priv" -in "${TEMP_WORK}/pq_payload.encap" -out "${TEMP_WORK}/pq_secret.bin"
         
-        echo "[*] 3/6 Decapsulating Post-Quantum KEM Secret..."
-        openssl pkeyutl "${PROVIDER_ARGS[@]}" -decap -inkey "${MY_PRIV_DIR}/pq_kem.priv" -in "${MSG_DIR}/pq_payload.encap" -out "${MSG_DIR}/pq_secret.bin"
+        echo "[*] 4/6 Performing Cryptographic Integrity Checks (HMAC Verification)..."
+        cat "${TEMP_WORK}/classic_secret.bin" "${TEMP_WORK}/pq_secret.bin" | openssl dgst -sha512 -binary > "${TEMP_WORK}/master_secret.bin"
+        HEX_KEY=$(xxd -p -c 64 "${TEMP_WORK}/master_secret.bin" | cut -c 1-64) 
+        MAC_KEY=$(xxd -p -c 64 "${TEMP_WORK}/master_secret.bin" | cut -c 65-128) 
         
-        echo "[*] 4/6 Verifying Authentication Tag (HMAC AEAD Check)..."
-        cat "${MSG_DIR}/classic_secret.bin" "${MSG_DIR}/pq_secret.bin" | openssl dgst -sha512 -binary > "${MSG_DIR}/master_secret.bin"
-        HEX_KEY=$(xxd -p -c 64 "${MSG_DIR}/master_secret.bin" | cut -c 1-64) 
-        MAC_KEY=$(xxd -p -c 64 "${MSG_DIR}/master_secret.bin" | cut -c 65-128) 
-        HEX_IV=$(cat "${MSG_DIR}/payload.iv")
+        openssl dgst -sha256 -mac HMAC -macopt hexkey:"$MAC_KEY" -binary -out "${TEMP_WORK}/calculated.tag" "${TEMP_WORK}/payload.cipher"
         
-        openssl dgst -sha256 -mac HMAC -macopt hexkey:"$MAC_KEY" -binary -out "${MSG_DIR}/calculated.tag" "${MSG_DIR}/payload.cipher"
-        
-        if cmp -s "${MSG_DIR}/payload.tag" "${MSG_DIR}/calculated.tag"; then
-            echo -e "\e[32m    -> AEAD INTEGRITY VALID: Ciphertext has not been tampered with.\e[0m"
+        if cmp -s "${TEMP_WORK}/payload.tag" "${TEMP_WORK}/calculated.tag"; then
+            echo -e "\e[32m    -> AEAD INTEGRITY VALID: Stream tampering checks passed.\e[0m"
         else
-            echo -e "\e[31m[-] CRITICAL: Authentication Tag Mismatch! Ciphertext is corrupt.\e[0m"
-            rm -f "${MSG_DIR}/classic_secret.bin" "${MSG_DIR}/pq_secret.bin" "${MSG_DIR}/master_secret.bin" "${MSG_DIR}/temp.bundle" "${MSG_DIR}/payload.hash" "${MSG_DIR}/calculated.tag"
+            echo -e "\e[31m[-] CRITICAL: Authentication Tag Mismatch! Packet structural contents manipulated.\e[0m"
+            rm -rf "$TEMP_WORK"
             exit 1
         fi
         
-        echo "[*] 5/6 Decrypting Payload (${CIPHER})..."
-        openssl enc -d -"${CIPHER}" -K "$HEX_KEY" -iv "$HEX_IV" -in "${MSG_DIR}/payload.cipher" -out "${MSG_DIR}/decrypted_message.txt"
+        echo "[*] 5/6 Decrypting Payload and Accessing Literal Enclave Enclosure..."
+        openssl enc -d -"${CIPHER}" -K "$HEX_KEY" -iv "$HEX_IV" -in "${TEMP_WORK}/payload.cipher" -out "${TEMP_WORK}/enclave.dec"
         
-        echo "[*] 6/6 Scrubbing memory..."
-        rm -f "${MSG_DIR}/classic_secret.bin" "${MSG_DIR}/pq_secret.bin" "${MSG_DIR}/master_secret.bin" "${MSG_DIR}/temp.bundle" "${MSG_DIR}/payload.hash" "${MSG_DIR}/calculated.tag"
+        # Unpacking Literal Enclave and stripping out padding
+        TARGET_FILENAME=$(sed -n '1p' "${TEMP_WORK}/enclave.dec")
+        TARGET_FILESIZE=$(sed -n '2p' "${TEMP_WORK}/enclave.dec")
         
-        echo -e "\n\e[32m[+] Message Decrypted Successfully!\e[0m"
-        echo "Payload extracted to: ${MSG_DIR}/decrypted_message.txt"
+        # Calculate exactly where text payload begins inside stream header block
+        HEADER_LINES_OFFSET=$(awk 'NR<=2 {print length($0)+1}' "${TEMP_WORK}/enclave.dec" | awk '{s+=$1} END {print s}')
+        
+        tail -c +"$((HEADER_LINES_OFFSET + 1))" "${TEMP_WORK}/enclave.dec" | head -c "$TARGET_FILESIZE" > "./decrypted_${TARGET_FILENAME}"
+        
+        echo "[*] 6/6 Purging temporary file handles..."
+        rm -rf "$TEMP_WORK"
+        
+        echo -e "\n\e[32m[+] Packet Stream Successfully Decoded and Restored!\e[0m"
+        echo "Original File Name: $TARGET_FILENAME ($TARGET_FILESIZE bytes)"
+        echo "Extracted plain payload file destination: ./decrypted_${TARGET_FILENAME}"
         ;;
         
     *)
